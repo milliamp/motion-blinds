@@ -11,6 +11,7 @@ import socket
 import json
 import struct
 import datetime
+import platform
 from enum import IntEnum
 from Cryptodome.Cipher import AES
 from threading import Thread
@@ -283,6 +284,7 @@ class MotionGateway(MotionCommunication):
         timeout: float = 3.0,
         mcast_timeout: float = 5.0,
         multicast: MotionMulticast = None,
+        pushes_multicast_reply_after_update = False
     ):
         self._ip = ip
         self._key = key
@@ -295,6 +297,8 @@ class MotionGateway(MotionCommunication):
 
         self._multicast = multicast
         self._registered_callbacks = {}
+
+        self._pushes_multicast_reply_after_update = pushes_multicast_reply_after_update
 
         self._device_list = {}
         self._device_type = None
@@ -421,7 +425,7 @@ class MotionGateway(MotionCommunication):
         
         # calculate the acces token
         self._get_access_token()
-        
+
         # add the discovered blinds to the device list.
         for blind in response["data"]:
             blind_type = blind["deviceType"]
@@ -725,11 +729,15 @@ class MotionBlind:
         if voltage > 9.4 and voltage <= 13.6:
             # 3 cel battery pack (12.6V)
             return round((voltage-10.4)*100/(12.6-10.4), 0)
+        
+        if voltage > 100.0:
+            # mains powered with no battery
+            return 100
 
         if voltage > 13.6:
             # 4 cel battery pack (16.8V)
             return round((voltage-14.6)*100/(16.8-14.6), 0)
-
+        
         return 0.0
 
     def _parse_response_common(self, response):
@@ -762,7 +770,12 @@ class MotionBlind:
         if self._blind_type in [BlindType.ShangriLaBlind]:
             self._max_angle = 90
 
-        self._RSSI = response["data"]["RSSI"]
+        # some blinds don't return their RSSI
+        try:
+            self._RSSI = response["data"]["RSSI"]
+        except KeyError:
+            self._RSSI = None
+
         self._available = True
 
     def _parse_response(self, response):
@@ -784,6 +797,8 @@ class MotionBlind:
                 self._status = BlindStatus.Unknown
             try:
                 self._limit_status = LimitStatus(response["data"]["currentState"])
+            except KeyError:
+                self._limit_status = LimitStatus.Unknown
             except ValueError:
                 if self._limit_status != LimitStatus.Unknown:
                     _LOGGER.error(
@@ -791,10 +806,22 @@ class MotionBlind:
                         self.mac,
                         response["data"]["currentState"],
                     )
-                self._status = LimitStatus.Unknown
-            self._position = response["data"]["currentPosition"]
-            self._angle = response["data"]["currentAngle"]*(180.0/self._max_angle)
-            self._battery_voltage = response["data"]["batteryLevel"]/100.0
+                self._limit_status = LimitStatus.Unknown
+            try:
+                self._position = response["data"]["currentPosition"]
+            except KeyError:
+                self._position = None
+            
+            try:
+                self._angle = response["data"]["currentAngle"]*(180.0/self._max_angle)
+            except KeyError:
+                self._angle = None
+
+            try:
+                self._battery_voltage = response["data"]["batteryLevel"]/100.0
+            except KeyError:
+                # Mains powered so no battery present, setting voltage to arbitrary 110V
+                self._battery_voltage = 110.0
 
             self._battery_level = self._calculate_battery_level(self._battery_voltage)
         except KeyError as ex:
@@ -866,6 +893,10 @@ class MotionBlind:
             # send update request
             self.Update_trigger()
             
+            # some Dooya gateways don't reply with an extra push after an update response
+            if self._gateway._pushes_multicast_reply_after_update == False:
+                return
+
             # wait on multicast push for new status
             try:
                 if self._gateway._multicast is None:
